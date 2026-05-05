@@ -14,6 +14,24 @@ class MessageHandler {
   // ✅ PASSO 0 — Mapa para controle de concorrência
   static activeProcessing = new Map(); // userId:customerNumber -> timestamp
 
+  // ✅ FUNÇÃO — Safe send com retry automático
+  static async safeSend(sock, jid, text, maxRetries = 2) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        return await sock.sendMessage(jid, { text });
+      } catch (sendError) {
+        logger.warn(`⚠️ Send attempt ${attempt} failed for ${jid}:`, sendError.message);
+        
+        if (attempt === maxRetries) {
+          throw sendError; // Última tentativa falhou
+        }
+        
+        // Esperar antes de tentar novamente
+        await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
+      }
+    }
+  }
+
   static async handleIncomingMessage(m, userId, sock, supabaseService) {
     try {
       logger.info(`📩 EVENT messages.upsert received`);
@@ -47,15 +65,23 @@ class MessageHandler {
         return;
       }
 
+      // ✅ PASSO 2 — Validar mensagem (anti-spam, etc)
+      const validation = this.validateMessage(messageContent);
+      if (!validation.isValid) {
+        logger.info(`🚫 Message validation failed for user ${userId}, reason: ${validation.reason}`);
+        return;
+      }
+
       const customerNumber = message.key.remoteJid?.replace('@s.whatsapp.net', '') || 'unknown';
-      const processingKey = `${userId}:${customerNumber}`;
+      const messageId = message.key.id || `unknown_${Date.now()}`;
+      const processingKey = `${userId}:${messageId}`;
       
       // ✅ Verificar se já está processando esta mesma mensagem
       const now = Date.now();
       const lastProcessing = this.activeProcessing.get(processingKey);
       
       if (lastProcessing && (now - lastProcessing) < 5000) { // 5 segundos de proteção
-        logger.info(`⚠️ Duplicate message processing prevented for user ${userId}, customer ${customerNumber}`);
+        logger.info(`⚠️ Duplicate message processing prevented for user ${userId}, message ${messageId}`);
         return;
       }
       
@@ -135,49 +161,77 @@ class MessageHandler {
         return;
       }
 
-      // 5. Logar mensagem recebida
-      await supabaseService.logIncomingMessage(userId, customerNumber, messageContent);
-
-      // 6. Enviar resposta automática
+      // 5. Enviar resposta automática (LOG DEPOIS - NÃO BLOQUEIA)
+      const fullJid = customerNumber + '@s.whatsapp.net';
       logger.info(`📤 Sending welcome auto reply to ${customerNumber} for user ${userId}`);
+      logger.info(`📋 Send details: JID=${fullJid}, Attempt=1, MaxRetries=2, MessageLength=${autoReplyText.length}`);
+      
+      // ✅ PASSO 1 — Validar socket antes de enviar
+      if (!sock?.user) {
+        logger.warn(`⚠️ Socket not ready for user ${userId}, skipping message to ${customerNumber}`);
+        return;
+      }
+      
+      // ✅ PASSO 2 — Delay apenas para conexões recentes (evita erro 515 sem lentidão)
+      if (sock.startTime && (Date.now() - sock.startTime < 5000)) {
+        logger.info(`⏳ Recent connection detected, waiting 2s to stabilize...`);
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
       
       try {
-        await sock.sendMessage(customerNumber + '@s.whatsapp.net', {
-          text: autoReplyText
-        });
+        await this.safeSend(sock, customerNumber + '@s.whatsapp.net', autoReplyText);
         
         logger.info(`✅ Welcome auto reply sent successfully to ${customerNumber}`);
         
+        // 6. Logar mensagem recebida (APÓS ENVIO - NÃO BLOQUEIA)
+        try {
+          await supabaseService.logIncomingMessage(userId, customerNumber, messageContent);
+        } catch (logError) {
+          logger.error(`❌ Failed to log incoming message for user ${userId}, customer ${customerNumber}:`, logError);
+        }
+        
         // 7. Logar mensagem enviada
-        await supabaseService.logOutgoingMessage(userId, customerNumber, autoReplyText);
+        try {
+          await supabaseService.logOutgoingMessage(userId, customerNumber, autoReplyText);
+        } catch (logError) {
+          logger.error(`❌ Failed to log outgoing message for user ${userId}, customer ${customerNumber}:`, logError.message);
+        }
         
         // 8. Atualizar cooldown
-        await supabaseService.updateCooldown(userId, customerNumber);
+        try {
+          await supabaseService.updateCooldown(userId, customerNumber);
+        } catch (cooldownError) {
+          logger.error(`❌ Failed to update cooldown for user ${userId}, customer ${customerNumber}:`, cooldownError.message);
+        }
         
         logger.info(`🎉 Auto reply process completed for user ${userId}, customer ${customerNumber}`);
         
       } catch (sendError) {
-        logger.error(`❌ Auto reply send failed to ${customerNumber}:`, sendError);
+        logger.error(`❌ Auto reply send failed to ${customerNumber}:`, sendError.message);
         
-        // Logar erro de envio
-        await supabaseService.logMessage(userId, {
-          direction: 'out',
-          from_number: 'bot',
-          to_number: customerNumber,
-          content: autoReplyText,
-          message_type: 'text',
-          status: 'failed',
-          is_auto_reply: true,
-          error_message: sendError.message
-        });
+        // ✅ CORREÇÃO — Log simples sem chamadas que podem falhar
+        try {
+          await supabaseService.logMessage(userId, {
+            direction: 'out',
+            from_number: 'bot',
+            to_number: customerNumber,
+            content: autoReplyText,
+            message_type: 'text',
+            status: 'failed',
+            is_auto_reply: true,
+            error_message: sendError.message
+          });
+        } catch (logError) {
+          logger.error(`❌ Failed to log send error:`, logError.message);
+        }
         
-        throw sendError;
+        // Não fazer throw para não quebrar o fluxo principal
       }
 
     } catch (error) {
       logger.error(`💥 Error handling message for user ${userId}:`, error);
       
-      // Opcional: notificar sobre erro no processamento
+      // ✅ CORREÇÃO — Log simples sem chamadas que podem falhar
       try {
         await supabaseService.logMessage(userId, {
           direction: 'system',
@@ -189,7 +243,7 @@ class MessageHandler {
           is_auto_reply: false
         });
       } catch (logError) {
-        logger.error('Failed to log error message:', logError);
+        logger.error('Failed to log error message:', logError.message);
       }
     }
   }
