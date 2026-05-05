@@ -44,9 +44,17 @@ class SessionManager {
     try {
       logger.info(`Starting WhatsApp session for user: ${userId}`);
 
-      // Verificar se já existe sessão ativa
+      // ✅ PASSO 1 — Proteção contra múltiplas sessões simultâneas
       if (this.sessions.has(userId)) {
         const existingSession = this.sessions.get(userId);
+        
+        // Se já está conectando ou com QR ativo, não criar nova sessão
+        if (existingSession.status === 'connecting' || existingSession.status === 'qr') {
+          logger.info(`Session already in progress for user: ${userId} (status: ${existingSession.status})`);
+          return existingSession;
+        }
+        
+        // Se já está conectado, retornar sessão existente
         if (existingSession.status === 'connected') {
           logger.info(`Session already connected for user: ${userId}`);
           return existingSession;
@@ -72,8 +80,7 @@ class SessionManager {
       // Criar estado de autenticação persistente
       const authPath = this.getAuthPath(userId);
       
-      // 🥇 PASSO 1 — limpa sessão
-      await fs.remove(authPath);
+      // ✅ PASSO 1 — NÃO apaga sessão existente
       await fs.ensureDir(authPath);
       
       logger.info(`Auth state loaded successfully for user: ${userId}`);
@@ -185,34 +192,54 @@ class SessionManager {
           const statusCode = update.lastDisconnect?.error?.output?.statusCode;
           logger.info(`CONNECTION CLOSED for user ${userId} - statusCode: ${statusCode}`);
           
-          // Tratamento específico para handshake rejeitado
-          if (statusCode === 405) {
-            logger.error(`Handshake rejected by WhatsApp server for user ${userId} - Browser/Version incompatibility`);
-            // Não tentar reconectar imediatamente para evitar loop infinito
-            sessionData.reconnectAttempts = sessionData.maxReconnectAttempts;
+          // ✅ PASSO 2 — Controle de estado adequado
+          // Se já está desconectado ou em processo de reconexão, não fazer nada
+          if (sessionData.status === 'disconnected' || sessionData.status === 'reconnecting') {
+            logger.info(`Already handling disconnection for user ${userId}, skipping...`);
+            return;
           }
           
-          const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== 405;
-
-          sessionData.status = 'disconnected';
+          // Tratamento específico para diferentes tipos de erro
+          const shouldNotReconnect = statusCode === DisconnectReason.loggedOut || 
+                                     statusCode === 405 || 
+                                     statusCode === 401;
+          
+          if (shouldNotReconnect) {
+            logger.error(`Session ${userId} should not reconnect - statusCode: ${statusCode}`);
+            sessionData.status = 'disconnected';
+            sessionData.reconnectAttempts = sessionData.maxReconnectAttempts;
+          } else {
+            sessionData.status = 'disconnected';
+          }
 
           // Atualizar status no Supabase
           await this.supabaseService.saveSessionStatus(userId, 'disconnected', {
             last_disconnected_at: new Date().toISOString()
           });
 
-          if (shouldReconnect && sessionData.reconnectAttempts < sessionData.maxReconnectAttempts) {
+          if (!shouldNotReconnect && sessionData.reconnectAttempts < sessionData.maxReconnectAttempts) {
             sessionData.reconnectAttempts++;
-            // 🥇 PASSO 3 — evita loop agressivo
-            const delayMs = 5000;
+            sessionData.status = 'reconnecting'; // ✅ Marcar estado de reconexão
+            
+            // ✅ Exponential backoff seguro
+            const delayMs = Math.min(5000 * Math.pow(2, sessionData.reconnectAttempts - 1), 30000);
             logger.info(`Attempting to reconnect for user ${userId} (attempt ${sessionData.reconnectAttempts}/${sessionData.maxReconnectAttempts}) - delay: ${delayMs}ms`);
             
             // Tentar reconectar após delay
-            setTimeout(() => {
-              this.startSession(userId);
-            }, delayMs); // Exponential backoff ou 8s para handshake rejected
+            setTimeout(async () => {
+              try {
+                // ✅ Verificar se ainda deve reconectar antes de iniciar
+                const currentSession = this.sessions.get(userId);
+                if (currentSession && currentSession.status === 'reconnecting') {
+                  await this.startSession(userId);
+                }
+              } catch (error) {
+                logger.error(`Failed to reconnect for user ${userId}:`, error);
+              }
+            }, delayMs);
           } else {
-            logger.error(`Max reconnection attempts reached for user ${userId} or logged out`);
+            logger.error(`Max reconnection attempts reached for user ${userId} or should not reconnect`);
+            sessionData.status = 'disconnected';
             this.sessions.delete(userId);
           }
         }
