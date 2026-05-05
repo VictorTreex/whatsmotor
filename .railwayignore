@@ -1,0 +1,19 @@
+# Ignorar arquivos Bun para forçar Node.js runtime
+bun.lock
+bun.lockb
+*.lockb
+
+# Ignorar pasta node_modules
+node_modules/
+
+# Ignorar arquivos de ambiente
+.env
+.env.local
+.env.*.local
+
+# Ignorar logs
+*.log
+logs/
+
+# Ignorar arquivos de auth local
+auth_info/
