@@ -11,11 +11,15 @@ const logger = pino({
 });
 
 class MessageHandler {
+  // ✅ PASSO 0 — Mapa para controle de concorrência
+  static activeProcessing = new Map(); // userId:customerNumber -> timestamp
+
   static async handleIncomingMessage(m, userId, sock, supabaseService) {
     try {
       logger.info(`📩 EVENT messages.upsert received`);
       const message = m.messages[0];
       
+      // ✅ PASSO 1 — Proteção contra eventos duplicados
       if (!message.message) {
         logger.debug(`Empty message received for user ${userId}`);
         return;
@@ -44,6 +48,26 @@ class MessageHandler {
       }
 
       const customerNumber = message.key.remoteJid?.replace('@s.whatsapp.net', '') || 'unknown';
+      const processingKey = `${userId}:${customerNumber}`;
+      
+      // ✅ Verificar se já está processando esta mesma mensagem
+      const now = Date.now();
+      const lastProcessing = this.activeProcessing.get(processingKey);
+      
+      if (lastProcessing && (now - lastProcessing) < 5000) { // 5 segundos de proteção
+        logger.info(`⚠️ Duplicate message processing prevented for user ${userId}, customer ${customerNumber}`);
+        return;
+      }
+      
+      // Marcar como processando
+      this.activeProcessing.set(processingKey, now);
+      
+      // Limpar entradas antigas (manter mapa limpo)
+      for (const [key, timestamp] of this.activeProcessing.entries()) {
+        if (now - timestamp > 30000) { // 30 segundos
+          this.activeProcessing.delete(key);
+        }
+      }
 
       logger.info(`📨 Incoming valid customer message from ${customerNumber}: "${messageContent.substring(0, 50)}..."`);
 
@@ -67,17 +91,48 @@ class MessageHandler {
         return;
       }
 
-      // 4. Verificar cooldown
-      const cooldownData = await supabaseService.checkCooldown(userId, customerNumber);
+      // 4. Verificar cooldown com proteção completa
+      let isInCooldown = false;
       
-      if (cooldownData?.last_sent_at) {
-        const cooldownTime = new Date(cooldownData.last_sent_at);
-        cooldownTime.setHours(cooldownTime.getHours() + cooldownHours);
+      try {
+        // ✅ PASSO 1 — Proteção contra falhas no Supabase
+        let cooldownData = null;
         
-        if (new Date() < cooldownTime) {
-          logger.info(`⏰ Customer in cooldown for user ${userId}, customer ${customerNumber}. Next reply at: ${cooldownTime}`);
-          return; // Ainda em cooldown
+        try {
+          cooldownData = await supabaseService.checkCooldown(userId, customerNumber);
+        } catch (cooldownError) {
+          logger.error(`❌ Cooldown check failed for user ${userId}, customer ${customerNumber}:`, cooldownError);
+          // Continuar sem cooldown em caso de erro
         }
+        
+        // ✅ PASSO 2 — Validar retorno do Supabase
+        if (cooldownData && typeof cooldownData === 'object' && cooldownData.last_sent_at) {
+          // ✅ PASSO 3 — Validar data e evitar Invalid Date
+          const lastDate = new Date(cooldownData.last_sent_at);
+          
+          if (!isNaN(lastDate.getTime())) {
+            const cooldownTime = new Date(lastDate);
+            cooldownTime.setHours(cooldownTime.getHours() + cooldownHours);
+            
+            if (new Date() < cooldownTime) {
+              logger.info(`⏰ Customer in cooldown for user ${userId}, customer ${customerNumber}. Next reply at: ${cooldownTime}`);
+              isInCooldown = true;
+            }
+          } else {
+            logger.warn(`⚠️ Invalid last_sent_at format for user ${userId}, customer ${customerNumber}: ${cooldownData.last_sent_at}`);
+          }
+        } else if (cooldownData) {
+          logger.warn(`⚠️ Invalid cooldown data structure for user ${userId}, customer ${customerNumber}`);
+        }
+        
+      } catch (error) {
+        logger.error(`💥 Critical error in cooldown logic for user ${userId}, customer ${customerNumber}:`, error);
+        // Continuar sem cooldown em caso de erro crítico
+      }
+      
+      // ✅ PASSO 4 — Retornar se ainda em cooldown
+      if (isInCooldown) {
+        return;
       }
 
       // 5. Logar mensagem recebida
