@@ -1,4 +1,5 @@
 const pino = require('pino');
+const SupabaseService = require('./supabaseService');
 
 const logger = pino({
   level: process.env.LOG_LEVEL || 'info',
@@ -13,6 +14,9 @@ const logger = pino({
 class MessageHandler {
   // ✅ PASSO 0 — Mapa para controle de concorrência
   static activeProcessing = new Map(); // userId:customerNumber -> timestamp
+  
+  // ✅ CACHE — Mapa para resolver LID->telefone
+  static jidCache = new Map(); // LID -> telefone válido
 
   // ✅ FUNÇÃO — Safe send com retry automático
   static async safeSend(sock, jid, text, maxRetries = 2) {
@@ -30,6 +34,162 @@ class MessageHandler {
         await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
       }
     }
+  }
+
+  // ✅ FUNÇÃO — Resolve JID com 5 níveis de fallback (NÍVEL PRO)
+  static async resolveJid(message, userId, supabaseService, sock = null) {
+    const rawJid = message.key.remoteJid;
+    
+    if (!rawJid) {
+      logger.warn('❌ No remoteJid in message');
+      return null;
+    }
+
+    logger.info(`📌 Resolving JID: ${rawJid}`);
+
+    // 🔥 NOVO NÍVEL 0 — Contacts do Baileys (fonte mais forte)
+    if (sock?.contacts && Object.keys(sock.contacts).length > 0) {
+      const contact = Object.values(sock.contacts).find(c => c.id === rawJid);
+      if (contact?.id?.endsWith('@s.whatsapp.net')) {
+        this.jidCache.set(rawJid, contact.id);
+        logger.info(`🔥 Nível 0: Contacts Baileys resolvido: ${contact.id}`);
+        return contact.id;
+      }
+    }
+
+    // 🥇 NÍVEL 1 — JID direto (mais confiável)
+    if (rawJid.endsWith('@s.whatsapp.net')) {
+      this.jidCache.set(rawJid, rawJid);
+      
+      // ✅ SALVAR NO BANCO - aprende novo contato
+      try {
+        const cleanPhone = SupabaseService.cleanPhone(rawJid);
+        await supabaseService.supabase
+          .from('jid_map')
+          .upsert({
+            lid: rawJid,
+            phone: cleanPhone,
+            user_id: userId
+          }, {
+            onConflict: 'lid,user_id'
+          });
+        logger.info(`💾 Banco salvo: ${rawJid} -> ${cleanPhone}`);
+      } catch (saveError) {
+        logger.warn(`⚠️ Erro ao salvar no banco: ${saveError.message}`);
+      }
+      
+      logger.info(`✅ Nível 1: JID direto resolvido: ${rawJid}`);
+      return rawJid;
+    }
+
+    // 🥈 NÍVEL 2 — participant (muito importante para grupos)
+    if (message.key.participant?.endsWith('@s.whatsapp.net')) {
+      const participantJid = message.key.participant;
+      this.jidCache.set(rawJid, participantJid);
+      
+      // ✅ SALVAR NO BANCO - aprende novo contato
+      try {
+        const cleanPhone = SupabaseService.cleanPhone(participantJid);
+        await supabaseService.supabase
+          .from('jid_map')
+          .upsert({
+            lid: rawJid,
+            phone: cleanPhone,
+            user_id: userId
+          }, {
+            onConflict: 'lid,user_id'
+          });
+        logger.info(`💾 Banco salvo (participant): ${rawJid} -> ${cleanPhone}`);
+      } catch (saveError) {
+        logger.warn(`⚠️ Erro ao salvar participant no banco: ${saveError.message}`);
+      }
+      
+      logger.info(`✅ Nível 2: Participant resolvido: ${participantJid}`);
+      return participantJid;
+    }
+
+    // 🥉 NÍVEL 3 — Cache de contatos
+    if (this.jidCache.has(rawJid)) {
+      const cachedJid = this.jidCache.get(rawJid);
+      logger.info(`✅ Nível 3: Cache resolvido: ${cachedJid}`);
+      return cachedJid;
+    }
+
+    // NÍVEL 3.5 — Persistência no banco (tabela jid_map)
+    if (rawJid.includes('@lid')) {
+      try {
+        logger.info(`🔍 Buscando LID no banco: ${rawJid}`);
+        
+        const { data } = await supabaseService.supabase
+          .from('jid_map')
+          .select('phone')
+          .eq('lid', rawJid)
+          .eq('user_id', userId)
+          .single();
+
+        if (data?.phone) {
+          // ✅ Limpar phone usando função utilitária
+          let phone = SupabaseService.cleanPhone(data.phone);
+          
+          // ✅ Blindagem contra duplicação de @s.whatsapp.net
+          const phoneJid = phone.includes('@s.whatsapp.net')
+            ? phone
+            : `${phone}@s.whatsapp.net`;
+          
+          this.jidCache.set(rawJid, phoneJid);
+          logger.info(`✅ Banco resolveu LID: ${phoneJid}`);
+          return phoneJid;
+        } else {
+          logger.warn(`❌ LID não encontrado no banco: ${rawJid}`);
+        }
+      } catch (dbError) {
+        logger.warn(`❌ Erro ao buscar no banco: ${dbError.message}`);
+      }
+    }
+
+    // 🧩 NÍVEL 4 — jidDecode (tentativa inteligente)
+    try {
+      const { jidDecode } = require('@whiskeysockets/baileys');
+      const decoded = jidDecode(rawJid);
+
+      if (decoded?.user) {
+        const decodedJid = `${decoded.user}@s.whatsapp.net`;
+        this.jidCache.set(rawJid, decodedJid);
+        
+        // ✅ SALVAR NO BANCO - aprende novo contato
+        try {
+          // ✅ Limpar decoded.user para remover caracteres não numéricos
+          const cleanPhone = decoded.user.replace(/\D/g, '');
+          await supabaseService.supabase
+            .from('jid_map')
+            .upsert({
+              lid: rawJid,
+              phone: cleanPhone,
+              user_id: userId
+            }, {
+              onConflict: 'lid,user_id'
+            });
+          logger.info(`💾 Banco salvo (decode): ${rawJid} -> ${cleanPhone}`);
+        } catch (saveError) {
+          logger.warn(`⚠️ Erro ao salvar decode no banco: ${saveError.message}`);
+        }
+        
+        logger.info(`✅ Nível 4: JID decode resolvido: ${decodedJid}`);
+        return decodedJid;
+      }
+    } catch (decodeError) {
+      logger.warn(`⚠️ JID decode failed: ${decodeError.message}`);
+    }
+
+    // 🧨 NÍVEL 5 — Fallback final (ignorar LID desconhecido)
+    if (rawJid.includes('@lid')) {
+      logger.warn(`❌ Nível 5: LID desconhecido, ignorando: ${rawJid}`);
+      return null;
+    }
+
+    // Formato desconhecido
+    logger.warn(`❌ Formato JID desconhecido: ${rawJid}`);
+    return null;
   }
 
   static async handleIncomingMessage(m, userId, sock, supabaseService) {
@@ -72,7 +232,16 @@ class MessageHandler {
         return;
       }
 
-      const customerNumber = message.key.remoteJid?.replace('@s.whatsapp.net', '') || 'unknown';
+      // ✅ PASSO 3 — Resolver JID com estratégia completa (NÍVEL PRO)
+      const resolvedJid = await this.resolveJid(message, userId, supabaseService, sock);
+      
+      if (!resolvedJid) {
+        logger.warn(`❌ Não foi possível resolver JID: ${message.key.remoteJid}`);
+        return;
+      }
+      
+      // Extrair número do JID resolvido para logs compatíveis
+      const customerNumber = SupabaseService.cleanPhone(resolvedJid);
       const messageId = message.key.id || `unknown_${Date.now()}`;
       const processingKey = `${userId}:${messageId}`;
       
@@ -98,7 +267,10 @@ class MessageHandler {
       logger.info(`📨 Incoming valid customer message from ${customerNumber}: "${messageContent.substring(0, 50)}..."`);
 
       // 1. Obter configuração de auto resposta
-      const autoResponderConfig = await supabaseService.getAutoResponderConfig(userId);
+      const autoResponderConfig = await supabaseService.getAutoResponderConfig(
+        userId,
+        message.key.remoteJid
+      );
       
       if (!autoResponderConfig) {
         logger.info(`❌ No active auto responder config for user ${userId}`);
@@ -162,9 +334,8 @@ class MessageHandler {
       }
 
       // 5. Enviar resposta automática (LOG DEPOIS - NÃO BLOQUEIA)
-      const fullJid = customerNumber + '@s.whatsapp.net';
       logger.info(`📤 Sending welcome auto reply to ${customerNumber} for user ${userId}`);
-      logger.info(`📋 Send details: JID=${fullJid}, Attempt=1, MaxRetries=2, MessageLength=${autoReplyText.length}`);
+      logger.info(`📋 Send details: JID=${resolvedJid}, Attempt=1, MaxRetries=2, MessageLength=${autoReplyText.length}`);
       
       // ✅ PASSO 1 — Validar socket antes de enviar
       if (!sock?.user) {
@@ -179,7 +350,7 @@ class MessageHandler {
       }
       
       try {
-        await this.safeSend(sock, customerNumber + '@s.whatsapp.net', autoReplyText);
+        await this.safeSend(sock, resolvedJid, autoReplyText);
         
         logger.info(`✅ Welcome auto reply sent successfully to ${customerNumber}`);
         
@@ -202,6 +373,22 @@ class MessageHandler {
           await supabaseService.updateCooldown(userId, customerNumber);
         } catch (cooldownError) {
           logger.error(`❌ Failed to update cooldown for user ${userId}, customer ${customerNumber}:`, cooldownError.message);
+        }
+        
+        // 🔥 MELHORIA PRO - Salvar JID quando envia (aprendizado)
+        try {
+          await supabaseService.supabase
+            .from('jid_map')
+            .upsert({
+              lid: resolvedJid,
+              phone: customerNumber,
+              user_id: userId
+            }, {
+              onConflict: 'lid,user_id'
+            });
+          logger.info(`🧠 Aprendizado: ${resolvedJid} -> ${customerNumber}`);
+        } catch (learnError) {
+          logger.warn(`⚠️ Erro ao salvar aprendizado: ${learnError.message}`);
         }
         
         logger.info(`🎉 Auto reply process completed for user ${userId}, customer ${customerNumber}`);

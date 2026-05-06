@@ -159,21 +159,32 @@ class SupabaseService {
 
   // ============ CONFIGURAÇÕES DE AUTO RESPOSTA ============
 
-  async getAutoResponderConfig(userId) {
+  async getAutoResponderConfig(userId, rawJid) {
     try {
-      const { data, error } = await this.supabase
-        .from('whatsapp_auto_messages')
-        .select('*')
-        .eq('store_id', userId)
-        .eq('is_active', true)
-        .single();
+      const { data } = await this.supabase
+        .from('jid_map')
+        .select('phone')
+        .eq('lid', rawJid)
+        .eq('user_id', userId)
+        .maybeSingle();
 
-      if (error && error.code !== 'PGRST116') {
-        logger.error('Error getting auto responder config:', error);
-        throw error;
+      if (data) {
+        const { data: autoResponderConfig, error } = await this.supabase
+          .from('whatsapp_auto_messages')
+          .select('*')
+          .eq('store_id', data.phone)
+          .eq('is_active', true)
+          .single();
+
+        if (error && error.code !== 'PGRST116') {
+          logger.error('Error getting auto responder config:', error);
+          throw error;
+        }
+
+        return autoResponderConfig;
+      } else {
+        return null;
       }
-
-      return data;
     } catch (error) {
       logger.error('Failed to get auto responder config:', error);
       throw error;
@@ -184,12 +195,15 @@ class SupabaseService {
 
   async checkCooldown(userId, customerNumber) {
     try {
+      // ✅ Limpar telefone antes de buscar
+      const cleanPhone = SupabaseService.cleanPhone(customerNumber);
+      
       const { data, error } = await this.supabase
         .from('whatsapp_contacts_cooldown')
         .select('last_sent_at')
         .eq('user_id', userId)
-        .eq('phone', customerNumber)
-        .single();
+        .eq('phone', cleanPhone)
+        .maybeSingle();
 
       if (error && error.code !== 'PGRST116') {
         logger.error('Error checking cooldown:', error);
@@ -205,11 +219,14 @@ class SupabaseService {
 
   async updateCooldown(userId, customerNumber) {
     try {
+      // ✅ Limpar telefone antes de salvar
+      const cleanPhone = SupabaseService.cleanPhone(customerNumber);
+      
       const { data, error } = await this.supabase
         .from('whatsapp_contacts_cooldown')
         .upsert({
           user_id: userId,
-          phone: customerNumber,
+          phone: cleanPhone,
           last_sent_at: new Date().toISOString()
         }, {
           onConflict: 'user_id,phone'
@@ -222,7 +239,7 @@ class SupabaseService {
         throw error;
       }
 
-      logger.info(`Cooldown updated for user ${userId}, customer ${customerNumber}`);
+      logger.info(`Cooldown updated for user ${userId}, customer ${cleanPhone}`);
       return data;
     } catch (error) {
       logger.error('Failed to update cooldown:', error);
@@ -259,7 +276,7 @@ class SupabaseService {
   async logIncomingMessage(userId, fromNumber, messageContent) {
     return this.logMessage(userId, {
       direction: 'in',
-      from_number: fromNumber,
+      from_number: SupabaseService.cleanPhone(fromNumber),
       to_number: 'bot',
       content: messageContent,
       message_type: 'text',
@@ -272,7 +289,7 @@ class SupabaseService {
     return this.logMessage(userId, {
       direction: 'out',
       from_number: 'bot',
-      to_number: toNumber,
+      to_number: SupabaseService.cleanPhone(toNumber),
       content: messageContent,
       message_type: 'text',
       status: 'sent',
@@ -281,6 +298,17 @@ class SupabaseService {
   }
 
   // ============ UTILITÁRIOS ============
+
+  // ✅ Função utilitária para limpar telefone (remover sufixos)
+  static cleanPhone(jid) {
+    if (!jid) return null;
+
+    return jid
+      .replace('@s.whatsapp.net', '')
+      .replace(/@lid.*/, '') // remove qualquer coisa após @lid
+      .replace(/\D/g, '') // deixa só números
+      .trim();
+  }
 
   async testConnection() {
     try {
