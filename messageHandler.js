@@ -267,10 +267,14 @@ class MessageHandler {
       logger.info(`📨 Incoming valid customer message from ${customerNumber}: "${messageContent.substring(0, 50)}..."`);
 
       // 1. Obter configuração de auto resposta
+      logger.info("DEBUG STEP 1 - chegou no auto responder");
+      
       const autoResponderConfig = await supabaseService.getAutoResponderConfig(
         userId,
         message.key.remoteJid
       );
+
+      logger.info("DEBUG STEP 2 - config:", autoResponderConfig);
       
       if (!autoResponderConfig) {
         logger.info(`❌ No active auto responder config for user ${userId}`);

@@ -161,33 +161,39 @@ class SupabaseService {
 
   async getAutoResponderConfig(userId, rawJid) {
     try {
-      const { data } = await this.supabase
+      const { data: mapData, error: mapError } = await this.supabase
         .from('jid_map')
         .select('phone')
         .eq('lid', rawJid)
         .eq('user_id', userId)
         .maybeSingle();
 
-      if (data) {
-        const { data: autoResponderConfig, error } = await this.supabase
-          .from('whatsapp_auto_messages')
-          .select('*')
-          .eq('store_id', data.phone)
-          .eq('is_active', true)
-          .single();
-
-        if (error && error.code !== 'PGRST116') {
-          logger.error('Error getting auto responder config:', error);
-          throw error;
-        }
-
-        return autoResponderConfig;
-      } else {
+      if (mapError) {
+        logger.error('jid_map error:', mapError);
         return null;
       }
+
+      if (!mapData?.phone) {
+        return null;
+      }
+
+      const { data: config, error: configError } = await this.supabase
+        .from('whatsapp_auto_messages')
+        .select('*')
+        .eq('store_id', mapData.phone)
+        .eq('is_active', true)
+        .maybeSingle();
+
+      if (configError) {
+        logger.error('auto_responder error:', configError);
+        return null;
+      }
+
+      return config || null;
+
     } catch (error) {
       logger.error('Failed to get auto responder config:', error);
-      throw error;
+      return null;
     }
   }
 
