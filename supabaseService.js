@@ -180,7 +180,7 @@ class SupabaseService {
       const { data: config, error: configError } = await this.supabase
         .from('whatsapp_auto_messages')
         .select('*')
-        .eq('store_id', mapData.phone)
+        .eq('store_id', userId)
         .eq('is_active', true)
         .maybeSingle();
 
