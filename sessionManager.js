@@ -200,9 +200,27 @@ class SessionManager {
           }
           
           // Tratamento específico para diferentes tipos de erro
-          const shouldNotReconnect = statusCode === DisconnectReason.loggedOut || 
-                                     statusCode === 405 || 
-                                     statusCode === 401;
+          const shouldNotReconnect = statusCode === DisconnectReason.loggedOut;
+          
+          // 🔥 TRATAMENTO ESPECIAL PARA ERRO 401
+          if (statusCode === 401) {
+            logger.warn(`401 detected - clearing session for ${userId}`);
+            
+            // Limpar pasta de autenticação
+            const authPath = this.getAuthPath(userId);
+            await fs.remove(authPath);
+            
+            // Remover do cache
+            this.sessions.delete(userId);
+            
+            // Forçar relogin automático após 5 segundos
+            setTimeout(() => {
+              logger.info(`Attempting automatic relogin for ${userId} after 401`);
+              this.startSession(userId);
+            }, 5000);
+            
+            return; // Não continuar com o fluxo normal
+          }
           
           if (shouldNotReconnect) {
             logger.error(`Session ${userId} should not reconnect - statusCode: ${statusCode}`);
